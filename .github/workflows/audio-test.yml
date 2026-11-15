@@ -1,0 +1,71 @@
+# Isolated source-built test IPA for the experimental virtio-snd branch.
+# Does not alter the upstream pinned-release ipa.yml or publish a release.
+name: audio-test-ipa
+
+on:
+  push:
+    branches:
+      - feat/virtio-audio
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      CRATE_ENGINE_REF: bd2efb4ae9d8567d581b1e6c2313ac21a112f1f2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_27.1.app
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
+
+      - name: Fetch pinned engine source and apply sound patch
+        run: |
+          git clone --filter=blob:none https://github.com/oneamendez/crate.git "$RUNNER_TEMP/crate-engine"
+          git -C "$RUNNER_TEMP/crate-engine" checkout --detach "$CRATE_ENGINE_REF"
+          python3 Scripts/audio/patch-engine.py "$RUNNER_TEMP/crate-engine"
+          git -C "$RUNNER_TEMP/crate-engine" diff --stat
+
+      - name: Check sound module and run unit tests
+        working-directory: ${{ runner.temp }}/crate-engine
+        run: |
+          cargo check -p crate-devices -p crate-virt -p crate-ffi
+          cargo test -p crate-devices --lib sound::
+
+      - name: Build modified engine XCFramework
+        env:
+          CRATE_DIR: ${{ runner.temp }}/crate-engine
+        run: Scripts/build-crate.sh
+
+      - name: Fetch app dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERIFY_ATTESTATION: "1"
+        run: |
+          Scripts/fetch-frameworks.sh
+          Scripts/fetch-stikjit.sh
+
+      - name: Build unsigned audio IPA
+        run: |
+          Scripts/build-ipa.sh "$RUNNER_TEMP/out/crate-audio-test-unsigned.ipa"
+          cd "$RUNNER_TEMP/out"
+          shasum -a 256 crate-audio-test-unsigned.ipa > crate-audio-test-unsigned.ipa.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crate-audio-test-unsigned
+          path: |
+            ${{ runner.temp }}/out/crate-audio-test-unsigned.ipa
+            ${{ runner.temp }}/out/crate-audio-test-unsigned.ipa.sha256
+          retention-days: 14
