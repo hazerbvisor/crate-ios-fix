@@ -16,6 +16,7 @@ struct SettingsScreen: View {
 
     @State private var memory = MemoryReport()
     @State private var logURL: URL?
+    @State private var audioTester = AudioBridge()
     @ScaledMetric(relativeTo: .body) private var statusDotSize = 9
 
     var body: some View {
@@ -24,11 +25,13 @@ struct SettingsScreen: View {
                 jitSection
                 memorySection
                 logsSection
+                audioSection
                 aboutSection
             }
             .navigationTitle("Settings")
             .task { await refreshMemory() }
             .onAppear { logURL = logsEnabled ? LogExport.prepare() : nil }
+            .onDisappear { audioTester.stop() }
         }
     }
 
@@ -200,6 +203,22 @@ struct SettingsScreen: View {
                 + "while a VM runs, about 40 KB an hour, so the log shows if iOS closed crate for using too much."
         }
         return text
+    }
+
+    // MARK: - Experimental audio
+
+    private var audioSection: some View {
+        Section {
+            Button {
+                audioTester.playTestTone()
+            } label: {
+                Label("Play iPad Test Tone", systemImage: "speaker.wave.2")
+            }
+        } header: {
+            Text("Experimental Audio")
+        } footer: {
+            Text("A short 440 Hz tone played directly through iOS, without Linux. If you hear this but Linux stays silent, inspect the guest ALSA driver and virtio-snd log messages. Check speaker volume before testing.")
+        }
     }
 
     // MARK: - About

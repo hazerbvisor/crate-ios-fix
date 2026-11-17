@@ -32,6 +32,7 @@ final class MachineRunner {
     private(set) var machineID: Machine.ID?
     let console = ConsoleBridge()
     let display = DisplayBridge()
+    private let audio = AudioBridge()
     private var machine: OpaquePointer?
     /// crate's memory in the log while the VM runs.
     private let memoryLog = MemoryLog()
@@ -84,15 +85,17 @@ final class MachineRunner {
         machineID = vm.id
         console.reset()
         display.reset()
+        audio.start()
         let settings = Settings(vm: vm, files: files, display: display)
         AppLog.write("vm: starting \(vm.name): \(settings.cpus) CPUs, \(settings.memoryMiB) MiB, "
                      + "code \(region.size >> 20) MiB; \(settings.commandLine)")
         let console = self.console
         let display = self.display
+        let audio = self.audio
         let context = Unmanaged.passUnretained(self).toOpaque()
         Task.detached(priority: .userInitiated) {
             let started = Date.now
-            let result = Self.create(settings, region: region, console: console, display: display, context: context)
+            let result = Self.create(settings, region: region, console: console, display: display, audio: audio, context: context)
             await MainActor.run {
                 switch result {
                 case .success(let made):
@@ -107,9 +110,11 @@ final class MachineRunner {
                         self.debugHooks.start(console: console, display: display)
                         #endif
                     } else {
+                        audio.stop()
                         self.phase = .failed("crate couldn't start the VM: \(String(cString: crate_last_error())).")
                     }
                 case .failure(let message):
+                    audio.stop()
                     AppLog.write("vm: \(message)")
                     self.phase = .failed(message)
                 }
@@ -213,7 +218,7 @@ final class MachineRunner {
     }
 
     nonisolated private static func create(_ settings: Settings, region: crate_code_region,
-                                           console: ConsoleBridge, display: DisplayBridge,
+                                           console: ConsoleBridge, display: DisplayBridge, audio: AudioBridge,
                                            context: UnsafeMutableRawPointer) -> Created {
         guard let config = crate_config_new("virt") else { return .failure("crate doesn't know the virt board.") }
         defer { crate_config_free(config) }
@@ -253,6 +258,13 @@ final class MachineRunner {
             },
             { check(crate_config_add_input(config, CRATE_INPUT_KEYBOARD | CRATE_INPUT_TABLET), "the keyboard and tablet") },
             {
+                check(crate_config_set_audio_output(config, { context, bytes, count in
+                    guard let context else { return }
+                    let bridge = Unmanaged<AudioBridge>.fromOpaque(context).takeUnretainedValue()
+                    bridge.receive(bytes, count: count)
+                }, Unmanaged.passUnretained(audio).toOpaque()), "audio output")
+            },
+            {
                 check(crate_config_set_state_callback(config, { context, state, reason in
                     guard let context, state == CRATE_STATE_STOPPED else { return }
                     let runner = Unmanaged<MachineRunner>.fromOpaque(context).takeUnretainedValue()
@@ -280,6 +292,7 @@ final class MachineRunner {
         }
         AppLog.write("vm: \(text)")
         memoryLog.stop()
+        audio.stop()
         #if DEBUG
         debugHooks.stop()
         #endif
