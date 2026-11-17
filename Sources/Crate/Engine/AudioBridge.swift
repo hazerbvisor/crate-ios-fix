@@ -22,6 +22,7 @@ final class AudioBridge: @unchecked Sendable {
     )!
     private var pending = 0
     private var enabled = false
+    private var loggedFirstPacket = false
 
     init() {
         engine.attach(player)
@@ -51,6 +52,7 @@ final class AudioBridge: @unchecked Sendable {
             player.stop()
             engine.stop()
             pending = 0
+            loggedFirstPacket = false
         }
     }
 
@@ -59,6 +61,10 @@ final class AudioBridge: @unchecked Sendable {
         guard let pointer, count > 0, count <= 256 * 1024, count % 4 == 0 else { return }
         let data = Data(bytes: pointer, count: count)
         queue.async { [self] in
+            if !loggedFirstPacket {
+                loggedFirstPacket = true
+                AppLog.write("audio: first PCM packet (\(data.count) bytes); iOS engine=\(engine.isRunning), enabled=\(enabled)")
+            }
             guard enabled, engine.isRunning, pending < 12 else { return }
             let frames = data.count / 4
             guard frames > 0,
@@ -86,5 +92,30 @@ final class AudioBridge: @unchecked Sendable {
                 }
             }
         }
+    }
+}
+
+extension AudioBridge {
+    /// Diagnostic tone bypassing Linux and virtio-snd. Helps distinguish
+    /// iOS audio output failure from a missing Linux ALSA device.
+    func playTestTone() {
+        start()
+        let frames = 24_000 // 0.5 s at 48 kHz
+        var samples = [UInt8](repeating: 0, count: frames * 4)
+        for frame in 0..<frames {
+            let envelope = min(1.0, Double(frame) / 480.0, Double(frames - frame - 1) / 480.0)
+            let wave = sin(Double(frame) * (2.0 * .pi * 440.0 / 48_000.0))
+            let sample = Int16((wave * envelope * 6_000.0).rounded())
+            let bits = UInt16(bitPattern: sample)
+            let offset = frame * 4
+            samples[offset] = UInt8(truncatingIfNeeded: bits)
+            samples[offset + 1] = UInt8(truncatingIfNeeded: bits >> 8)
+            samples[offset + 2] = samples[offset]
+            samples[offset + 3] = samples[offset + 1]
+        }
+        samples.withUnsafeBufferPointer {
+            receive($0.baseAddress, count: samples.count)
+        }
+        AppLog.write("audio: scheduled iOS-only diagnostic tone")
     }
 }
