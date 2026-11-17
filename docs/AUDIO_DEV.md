@@ -31,6 +31,45 @@ Do not overwrite your known-good installation without backing up its VM files.
 
 The original release workflow `.github/workflows/ipa.yml` remains untouched.
 
+## Diagnosing complete silence (audio-test v2)
+
+1. In **crate > Settings > Experimental Audio**, press **Play iPad Test Tone**.
+   It should produce a soft 440 Hz tone for about half a second without
+   requiring a VM. Turn up the iPad speaker volume. If this is silent, the
+   iOS audio session/route is failing, independently of Linux.
+2. In the Debian 13 VM, run the commands below. The guest kernel must have
+   `CONFIG_SND_VIRTIO` enabled for the virtual sound device.
+3. If the card appears, try ALSA directly, bypassing PipeWire. Check the
+   device number from `aplay -l`; replace `hw:0,0` with your actual device.
+4. Settings > Logs > Export Logs: look for
+   `virtio-snd: queues activated by Linux driver`,
+   `virtio-snd: playback state 2 -> 3`,
+   `virtio-snd: first Linux PCM packet`,
+   `audio: first PCM packet`, and
+   `audio: output ready`. These pinpoint where audio stops.
+
+```sh
+uname -r
+grep '^CONFIG_SND_VIRTIO=' "/boot/config-$(uname -r)" 2>/dev/null || true
+sudo modprobe snd_virtio
+lsmod | grep snd_virtio
+cat /proc/asound/cards
+aplay -l
+dmesg | grep -Ei 'virtio.*snd|virtio.*sound|alsa' | tail -40
+```
+
+If `aplay` isn't installed, use `sudo apt install alsa-utils` after
+`sudo apt update`. If `modprobe` reports **Module not found** for the
+running kernel, merely installing ALSA tools will not fix it; matching guest
+kernel modules/configuration are required. Don't update the kernel blindly
+because crate boots the kernel shipped with its VM image.
+
+When `aplay -l` shows a real card, test directly:
+
+```sh
+speaker-test -D hw:0,0 -c 2 -r 48000 -F S16_LE -t sine -l 1
+```
+
 ## Linux smoke tests
 
 Boot the signed test IPA and open a terminal in Ubuntu / Debian / Arch:
