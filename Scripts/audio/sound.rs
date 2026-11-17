@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate_core::warn;
+use crate_core::{info, warn};
 use super::{Activation, F_VERSION_1, Interrupt, Queue, VirtioDevice, read_config_bytes};
 
 const ID_SOUND: u32 = 25;
@@ -40,6 +40,7 @@ pub struct Sound {
 
 impl Sound {
     pub fn new(output: Output) -> Self {
+        info!("virtio-snd: presenting stereo output device to the guest");
         Self {
             output,
             state: Arc::new(AtomicU8::new(0)),
@@ -122,6 +123,7 @@ impl Sound {
 
     fn process_control(&mut self) {
         let Some((queue, interrupt)) = &mut self.control else { return; };
+        let before = self.state.load(Ordering::Acquire);
         let mut used = false;
         loop {
             let chain = match queue.pop() {
@@ -138,6 +140,16 @@ impl Sound {
             used = true;
         }
         if used && queue.needs_interrupt() { interrupt.signal_used(); }
+        let after = self.state.load(Ordering::Acquire);
+        if before != after {
+            info!("virtio-snd: playback state {before} -> {after}");
+            // Linux can enqueue playback data before PCM_START. The worker
+            // must leave it in the virtqueue until the stream is started.
+            // Wake it on START/STOP/RELEASE, even without a new TX kick.
+            if let Some(wake) = &self.tx_wake {
+                let _ = wake.send(());
+            }
+        }
     }
 }
 
@@ -156,6 +168,7 @@ impl VirtioDevice for Sound {
         let mut queues = activation.queues.into_iter();
         let (Some(ctrl), Some(_event), Some(tx), Some(_rx)) =
             (queues.next(), queues.next(), queues.next(), queues.next()) else { return; };
+        info!("virtio-snd: queues activated by Linux driver");
         self.control = Some((ctrl, activation.interrupt.clone()));
         let (sender, receiver) = mpsc::channel::<()>();
         let queue = Arc::new(Mutex::new(tx));
@@ -165,8 +178,16 @@ impl VirtioDevice for Sound {
         let output = self.output.clone();
         // Dropping the sender on reset makes this worker exit.
         thread::spawn(move || {
+            let mut logged_first_pcm = false;
             while receiver.recv().is_ok() {
                 loop {
+                    // Never pop/complete early playback buffers before START.
+                    // A Linux PCM driver may prime the TX ring in PREPARED
+                    // state. Completing those buffers silently loses audio.
+                    // STOP and RELEASE deliberately drain pending requests.
+                    if matches!(state.load(Ordering::Acquire), 1 | 2) {
+                        break;
+                    }
                     let chain = match queue.lock().unwrap().pop() {
                         Ok(Some(c)) => c,
                         Ok(None) => break,
@@ -180,6 +201,10 @@ impl VirtioDevice for Sound {
                             let pcm = &bytes[4..];
                             if id == 0 && pcm.len() % 4 == 0 && pcm.len() <= MAX_TRANSFER {
                                 if state.load(Ordering::Acquire) == 3 && !pcm.is_empty() {
+                                    if !logged_first_pcm {
+                                        info!("virtio-snd: first Linux PCM packet ({} bytes)", pcm.len());
+                                        logged_first_pcm = true;
+                                    }
                                     output(pcm);
                                     // Complete at roughly the sample clock rate, so the
                                     // guest cannot flood the host player with data.
